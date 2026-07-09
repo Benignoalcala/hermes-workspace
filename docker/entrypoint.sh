@@ -38,8 +38,9 @@ if [ "$(id -u)" = "0" ]; then
   fi
 
   mkdir -p "$WORKSPACE_HOME/.hermes" /workspace
-  fix_owner_if_needed "$WORKSPACE_HOME"
-  fix_owner_if_needed /workspace
+chown -R "$WORKSPACE_USER:$WORKSPACE_GROUP" "$WORKSPACE_HOME/.hermes" 2>/dev/null || true
+fix_owner_if_needed "$WORKSPACE_HOME"
+fix_owner_if_needed /workspace
 
   echo "Dropping root privileges"
   exec gosu "$WORKSPACE_USER:$WORKSPACE_GROUP" "$0" "$@"
