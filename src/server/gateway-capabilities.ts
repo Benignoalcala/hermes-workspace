@@ -259,8 +259,18 @@ let dashboardTokenPromise: Promise<string> | null = null
 let dashboardTokenCache = ''
 let dashboardSessionCookieCache = ''
 
-/** Optional bearer token for authenticated gateway endpoints. */
-export const BEARER_TOKEN = process.env.HERMES_API_TOKEN || process.env.CLAUDE_API_TOKEN || ''
+/**
+ * Optional bearer token for authenticated gateway endpoints.
+ *
+ * Read at request time because vite-node SSR can evaluate this module before
+ * Railway's runtime environment has been exposed to the request handler.
+ */
+export function getGatewayBearerToken(): string {
+  return process.env.HERMES_API_TOKEN || process.env.CLAUDE_API_TOKEN || ''
+}
+
+/** @deprecated Use getGatewayBearerToken() for request authentication. */
+export const BEARER_TOKEN = getGatewayBearerToken()
 
 /**
  * Dashboard API auth uses the ephemeral session token injected into the
@@ -269,7 +279,16 @@ export const BEARER_TOKEN = process.env.HERMES_API_TOKEN || process.env.CLAUDE_A
  * time the dashboard restarts.
  */
 function authHeaders(): Record<string, string> {
-  return BEARER_TOKEN ? { Authorization: `Bearer ${BEARER_TOKEN}` } : {}
+  const bearer = getGatewayBearerToken()
+  return bearer ? { Authorization: `Bearer ${bearer}` } : {}
+}
+
+function isGatewayDestination(target: string): boolean {
+  try {
+    return new URL(target).origin === new URL(CLAUDE_API).origin
+  } catch {
+    return false
+  }
 }
 
 function isConfiguredDashboardDestination(target: string): boolean {
@@ -475,8 +494,10 @@ export async function gatewayFetch(
     ? path
     : `${CLAUDE_API}${path.startsWith('/') ? path : `/${path}`}`
   const headers = new Headers(init.headers)
-  for (const [k, v] of Object.entries(authHeaders())) {
-    if (!headers.has(k)) headers.set(k, v)
+  if (isGatewayDestination(url)) {
+    for (const [k, v] of Object.entries(authHeaders())) {
+      if (!headers.has(k)) headers.set(k, v)
+    }
   }
   return fetch(url, { ...init, headers })
 }

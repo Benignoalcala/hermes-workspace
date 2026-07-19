@@ -44,6 +44,8 @@ beforeEach(() => {
   delete process.env.CLAUDE_DASHBOARD_TOKEN
   delete process.env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME
   delete process.env.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
+  delete process.env.HERMES_API_TOKEN
+  delete process.env.CLAUDE_API_TOKEN
   delete process.env.HOST
 })
 
@@ -57,6 +59,34 @@ async function loadMod() {
 }
 
 describe('gateway-capabilities', () => {
+  it('reads gateway authentication at request time', async () => {
+    const mod = await loadMod()
+    process.env.HERMES_API_TOKEN = 'runtime-gateway-token'
+    fetchMock.mockResolvedValue(new Response('{}', { status: 200 }))
+
+    await mod.gatewayFetch('/api/sessions')
+
+    const request = fetchMock.mock.calls
+      .filter(([url]) => String(url).endsWith('/api/sessions'))
+      .at(-1)
+    const headers = new Headers(request?.[1]?.headers)
+    expect(headers.get('Authorization')).toBe('Bearer runtime-gateway-token')
+  })
+
+  it('does not send gateway authentication to another origin', async () => {
+    const mod = await loadMod()
+    process.env.HERMES_API_TOKEN = 'runtime-gateway-token'
+    fetchMock.mockResolvedValue(new Response('{}', { status: 200 }))
+
+    await mod.gatewayFetch('https://untrusted.example/api/sessions')
+
+    const request = fetchMock.mock.calls
+      .filter(([url]) => String(url).startsWith('https://untrusted.example/'))
+      .at(-1)
+    const headers = new Headers(request?.[1]?.headers)
+    expect(headers.get('Authorization')).toBeNull()
+  })
+
   it('default port is 8642', async () => {
     const mod = await loadMod()
     expect(mod.CLAUDE_API).toBe('http://127.0.0.1:8642')
