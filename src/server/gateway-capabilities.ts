@@ -257,6 +257,7 @@ let lastProbeAt = 0
 let lastLoggedSummary = ''
 let dashboardTokenPromise: Promise<string> | null = null
 let dashboardTokenCache = ''
+let dashboardSessionCookieCache = ''
 
 /** Optional bearer token for authenticated gateway endpoints. */
 export const BEARER_TOKEN = process.env.HERMES_API_TOKEN || process.env.CLAUDE_API_TOKEN || ''
@@ -271,37 +272,66 @@ function authHeaders(): Record<string, string> {
   return BEARER_TOKEN ? { Authorization: `Bearer ${BEARER_TOKEN}` } : {}
 }
 
-/**
- * Optional HTTP Basic credentials for a dashboard protected by an external
- * reverse proxy. Keep these credentials server-side and scope them to the
- * configured dashboard URL; gateway and arbitrary absolute URLs must never
- * receive them.
- */
-function dashboardBasicAuthHeaders(target: string): Record<string, string> {
-  const username = process.env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME
-  const password = process.env.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
+function isConfiguredDashboardDestination(target: string): boolean {
   const configuredUrl = process.env.HERMES_DASHBOARD_URL
-  if (!username || !password || !configuredUrl) return {}
-
-  const normalizedConfiguredUrl = normalizeUrl(configuredUrl)
-  if (normalizedConfiguredUrl !== CLAUDE_DASHBOARD_URL) return {}
-
+  if (!configuredUrl || normalizeUrl(configuredUrl) !== CLAUDE_DASHBOARD_URL) {
+    return false
+  }
   try {
-    const configured = new URL(`${normalizedConfiguredUrl}/`)
+    const configured = new URL(`${CLAUDE_DASHBOARD_URL}/`)
     const destination = new URL(target)
-    const configuredPath = configured.pathname.replace(/\/+$/, '')
-    const destinationPath = destination.pathname.replace(/\/+$/, '')
-    const isConfiguredDestination =
-      destination.origin === configured.origin &&
-      (destinationPath === configuredPath ||
-        destinationPath.startsWith(`${configuredPath}/`))
-    if (!isConfiguredDestination) return {}
+    return destination.origin === configured.origin
   } catch {
-    return {}
+    return false
+  }
+}
+
+function responseCookies(response: Response): string {
+  const headers = response.headers as Headers & { getSetCookie?: () => string[] }
+  const setCookies = headers.getSetCookie?.() ?? []
+  return setCookies
+    .map((value) => value.split(';', 1)[0]?.trim())
+    .filter(Boolean)
+    .join('; ')
+}
+
+async function dashboardPasswordLogin(): Promise<string> {
+  const password = process.env.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
+  if (!password || !isConfiguredDashboardDestination(`${CLAUDE_DASHBOARD_URL}/`)) {
+    return ''
   }
 
-  const encoded = Buffer.from(`${username}:${password}`, 'utf8').toString('base64')
-  return { Authorization: `Basic ${encoded}` }
+  const providersResponse = await fetch(`${CLAUDE_DASHBOARD_URL}/api/auth/providers`, {
+    redirect: 'manual',
+    signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+  })
+  if (!providersResponse.ok) return ''
+  const providerPayload = (await providersResponse.json().catch(() => null)) as {
+    providers?: Array<{ name?: string; supports_password?: boolean }>
+  } | null
+  const provider = providerPayload?.providers?.find(
+    (candidate) => candidate.supports_password && candidate.name,
+  )?.name
+  if (!provider) return ''
+
+  const loginResponse = await fetch(`${CLAUDE_DASHBOARD_URL}/auth/password-login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      provider,
+      username: process.env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME || '',
+      password,
+      next: '/',
+    }),
+    redirect: 'manual',
+    signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+  })
+  if (!loginResponse.ok || loginResponse.status >= 300) return ''
+  const loginPayload = (await loginResponse.json().catch(() => null)) as {
+    ok?: boolean
+  } | null
+  if (!loginPayload?.ok) return ''
+  return responseCookies(loginResponse)
 }
 
 /**
@@ -325,8 +355,14 @@ export async function fetchDashboardToken(options?: {
     // gracefully — the caller already handles 401/non-ok via safeJson.
     try {
       const dashboardRoot = `${CLAUDE_DASHBOARD_URL}/`
+      const sessionCookie = await dashboardPasswordLogin()
+      if (sessionCookie) dashboardSessionCookieCache = sessionCookie
       const res = await fetch(`${CLAUDE_DASHBOARD_URL}/`, {
-        headers: dashboardBasicAuthHeaders(dashboardRoot),
+        headers:
+          sessionCookie && isConfiguredDashboardDestination(dashboardRoot)
+            ? { Cookie: sessionCookie }
+            : {},
+        redirect: 'manual',
         signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       })
       if (!res.ok) {
@@ -370,7 +406,8 @@ export async function dashboardAuthHeaders(options?: {
   force?: boolean
 }): Promise<Record<string, string>> {
   const token = await getDashboardToken(options)
-  return token ? { Authorization: `Bearer ${token}` } : {}
+  if (token) return { Authorization: `Bearer ${token}` }
+  return dashboardSessionCookieCache ? { Cookie: dashboardSessionCookieCache } : {}
 }
 
 function withDashboardBase(path: string): string {
@@ -396,7 +433,12 @@ export async function dashboardFetch(
       !requestPath.endsWith('/api/dashboard/plugins') &&
       !requestPath.endsWith('/api/dashboard/plugins/rescan')
 
-    if (isProtected && !headers.has('Authorization')) {
+    if (
+      isProtected &&
+      isConfiguredDashboardDestination(requestPath) &&
+      !headers.has('Authorization') &&
+      !headers.has('Cookie')
+    ) {
       const auth = await dashboardAuthHeaders({ force: forceToken })
       for (const [key, value] of Object.entries(auth)) {
         headers.set(key, value)
@@ -413,6 +455,7 @@ export async function dashboardFetch(
   let res = await doFetch(false)
   if (res.status === 401) {
     dashboardTokenCache = ''
+    dashboardSessionCookieCache = ''
     res = await doFetch(true)
   }
   return res

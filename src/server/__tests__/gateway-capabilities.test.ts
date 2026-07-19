@@ -175,32 +175,66 @@ describe('gateway-capabilities', () => {
   })
 
   describe('dashboard session token scraping', () => {
-    it('uses Basic Auth only to scrape the configured dashboard root', async () => {
+    it('logs in through the password endpoint and requests the root with its session cookie', async () => {
       process.env.HERMES_DASHBOARD_URL = 'http://dashboard.test:9119'
       process.env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME = 'workspace-user'
       process.env.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = 'workspace-password'
-      fetchMock.mockResolvedValue({
-        ok: true,
-        status: 200,
-        text: async () => '<script>window.__HERMES_SESSION_TOKEN__="ephemeral-token"</script>',
+      fetchMock.mockImplementation(async (url: string) => {
+        if (url.endsWith('/api/auth/providers')) {
+          return Response.json({
+            providers: [{ name: 'password-provider', supports_password: true }],
+          })
+        }
+        if (url.endsWith('/auth/password-login')) {
+          return new Response(JSON.stringify({ ok: true, next: '/' }), {
+            headers: { 'set-cookie': 'hermes_session_at=session-cookie; HttpOnly; Path=/' },
+          })
+        }
+        return new Response(
+          '<script>window.__HERMES_SESSION_TOKEN__="ephemeral-token"</script>',
+        )
       })
 
       const mod = await loadMod()
       await expect(mod.fetchDashboardToken()).resolves.toBe('ephemeral-token')
 
-      const [, init] = fetchMock.mock.calls.find(
+      const [, loginInit] = fetchMock.mock.calls.find(
+        ([url]) => url === 'http://dashboard.test:9119/auth/password-login',
+      ) ?? []
+      expect(loginInit?.method).toBe('POST')
+      expect(new Headers(loginInit?.headers).get('Content-Type')).toBe('application/json')
+      expect(JSON.parse(String(loginInit?.body))).toEqual({
+        provider: 'password-provider',
+        username: 'workspace-user',
+        password: 'workspace-password',
+        next: '/',
+      })
+      expect(new Headers(loginInit?.headers).has('Authorization')).toBe(false)
+
+      const [, rootInit] = fetchMock.mock.calls.find(
         ([url]) => url === 'http://dashboard.test:9119/',
       ) ?? []
-      expect(new Headers(init?.headers).get('Authorization')).toBe(
-        `Basic ${Buffer.from('workspace-user:workspace-password').toString('base64')}`,
+      expect(new Headers(rootInit?.headers).get('Cookie')).toBe(
+        'hermes_session_at=session-cookie',
       )
+      expect(new Headers(rootInit?.headers).has('Authorization')).toBe(false)
     })
 
     it('uses the ephemeral Bearer token for subsequent dashboard API calls', async () => {
       process.env.HERMES_DASHBOARD_URL = 'http://dashboard.test:9119'
       process.env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME = 'workspace-user'
       process.env.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = 'workspace-password'
-      fetchMock.mockImplementation(async (url: string) => {
+      fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.endsWith('/api/auth/providers')) {
+          return Response.json({
+            providers: [{ name: 'password-provider', supports_password: true }],
+          })
+        }
+        if (url.endsWith('/auth/password-login')) {
+          return new Response(JSON.stringify({ ok: true, next: '/' }), {
+            headers: { 'set-cookie': 'hermes_session_at=session-cookie; HttpOnly; Path=/' },
+          })
+        }
         if (url === 'http://dashboard.test:9119/') {
           return new Response(
             '<script>window.__HERMES_SESSION_TOKEN__="ephemeral-token"</script>',
@@ -218,9 +252,47 @@ describe('gateway-capabilities', () => {
       expect(new Headers(init?.headers).get('Authorization')).toBe(
         'Bearer ephemeral-token',
       )
+      expect(new Headers(init?.headers).has('Cookie')).toBe(false)
     })
 
-    it('does not send dashboard Basic Auth to an arbitrary absolute URL', async () => {
+    it('uses the password session cookie when gated HTML contains no ephemeral token', async () => {
+      process.env.HERMES_DASHBOARD_URL = 'http://dashboard.test:9119'
+      process.env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME = 'workspace-user'
+      process.env.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = 'workspace-password'
+      fetchMock.mockImplementation(async (url: string) => {
+        if (url.endsWith('/api/auth/providers')) {
+          return Response.json({
+            providers: [{ name: 'password-provider', supports_password: true }],
+          })
+        }
+        if (url.endsWith('/auth/password-login')) {
+          return new Response(JSON.stringify({ ok: true, next: '/' }), {
+            headers: { 'set-cookie': 'hermes_session_at=session-cookie; HttpOnly; Path=/' },
+          })
+        }
+        if (url === 'http://dashboard.test:9119/') {
+          return new Response('<html>authenticated dashboard</html>')
+        }
+        return new Response('{}', { status: 200 })
+      })
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+      const mod = await loadMod()
+      await mod.dashboardFetch('/api/sessions')
+
+      const [, init] = fetchMock.mock.calls.find(
+        ([url]) => url === 'http://dashboard.test:9119/api/sessions',
+      ) ?? []
+      expect(new Headers(init?.headers).get('Cookie')).toBe(
+        'hermes_session_at=session-cookie',
+      )
+      expect(new Headers(init?.headers).has('Authorization')).toBe(false)
+      expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('workspace-password')
+      expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('session-cookie')
+      warnSpy.mockRestore()
+    })
+
+    it('does not send dashboard credentials to an arbitrary absolute URL', async () => {
       process.env.HERMES_DASHBOARD_URL = 'http://dashboard.test:9119'
       process.env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME = 'workspace-user'
       process.env.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = 'workspace-password'
@@ -231,6 +303,7 @@ describe('gateway-capabilities', () => {
 
       const [, init] = fetchMock.mock.calls.at(-1) ?? []
       expect(new Headers(init?.headers).has('Authorization')).toBe(false)
+      expect(new Headers(init?.headers).has('Cookie')).toBe(false)
     })
 
     it('preserves unauthenticated root scraping when Basic credentials are absent', async () => {
