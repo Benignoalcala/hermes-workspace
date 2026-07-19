@@ -272,6 +272,39 @@ function authHeaders(): Record<string, string> {
 }
 
 /**
+ * Optional HTTP Basic credentials for a dashboard protected by an external
+ * reverse proxy. Keep these credentials server-side and scope them to the
+ * configured dashboard URL; gateway and arbitrary absolute URLs must never
+ * receive them.
+ */
+function dashboardBasicAuthHeaders(target: string): Record<string, string> {
+  const username = process.env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME
+  const password = process.env.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
+  const configuredUrl = process.env.HERMES_DASHBOARD_URL
+  if (!username || !password || !configuredUrl) return {}
+
+  const normalizedConfiguredUrl = normalizeUrl(configuredUrl)
+  if (normalizedConfiguredUrl !== CLAUDE_DASHBOARD_URL) return {}
+
+  try {
+    const configured = new URL(`${normalizedConfiguredUrl}/`)
+    const destination = new URL(target)
+    const configuredPath = configured.pathname.replace(/\/+$/, '')
+    const destinationPath = destination.pathname.replace(/\/+$/, '')
+    const isConfiguredDestination =
+      destination.origin === configured.origin &&
+      (destinationPath === configuredPath ||
+        destinationPath.startsWith(`${configuredPath}/`))
+    if (!isConfiguredDestination) return {}
+  } catch {
+    return {}
+  }
+
+  const encoded = Buffer.from(`${username}:${password}`, 'utf8').toString('base64')
+  return { Authorization: `Basic ${encoded}` }
+}
+
+/**
  * Resolve the current dashboard session token by scraping the dashboard root
  * HTML. The dashboard injects a fresh ephemeral token at boot, so cached or
  * manually copied env tokens become invalid after restarts.
@@ -291,7 +324,9 @@ export async function fetchDashboardToken(options?: {
     // is broken (500), return empty string so protected API calls degrade
     // gracefully — the caller already handles 401/non-ok via safeJson.
     try {
+      const dashboardRoot = `${CLAUDE_DASHBOARD_URL}/`
       const res = await fetch(`${CLAUDE_DASHBOARD_URL}/`, {
+        headers: dashboardBasicAuthHeaders(dashboardRoot),
         signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       })
       if (!res.ok) {

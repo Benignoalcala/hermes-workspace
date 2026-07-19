@@ -42,6 +42,8 @@ beforeEach(() => {
   delete process.env.HERMES_DASHBOARD_URL
   delete process.env.HERMES_DASHBOARD_TOKEN
   delete process.env.CLAUDE_DASHBOARD_TOKEN
+  delete process.env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME
+  delete process.env.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
   delete process.env.HOST
 })
 
@@ -173,6 +175,81 @@ describe('gateway-capabilities', () => {
   })
 
   describe('dashboard session token scraping', () => {
+    it('uses Basic Auth only to scrape the configured dashboard root', async () => {
+      process.env.HERMES_DASHBOARD_URL = 'http://dashboard.test:9119'
+      process.env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME = 'workspace-user'
+      process.env.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = 'workspace-password'
+      fetchMock.mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: async () => '<script>window.__HERMES_SESSION_TOKEN__="ephemeral-token"</script>',
+      })
+
+      const mod = await loadMod()
+      await expect(mod.fetchDashboardToken()).resolves.toBe('ephemeral-token')
+
+      const [, init] = fetchMock.mock.calls.find(
+        ([url]) => url === 'http://dashboard.test:9119/',
+      ) ?? []
+      expect(new Headers(init?.headers).get('Authorization')).toBe(
+        `Basic ${Buffer.from('workspace-user:workspace-password').toString('base64')}`,
+      )
+    })
+
+    it('uses the ephemeral Bearer token for subsequent dashboard API calls', async () => {
+      process.env.HERMES_DASHBOARD_URL = 'http://dashboard.test:9119'
+      process.env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME = 'workspace-user'
+      process.env.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = 'workspace-password'
+      fetchMock.mockImplementation(async (url: string) => {
+        if (url === 'http://dashboard.test:9119/') {
+          return new Response(
+            '<script>window.__HERMES_SESSION_TOKEN__="ephemeral-token"</script>',
+          )
+        }
+        return new Response('{}', { status: 200 })
+      })
+
+      const mod = await loadMod()
+      await mod.dashboardFetch('/api/sessions')
+
+      const [, init] = fetchMock.mock.calls.find(
+        ([url]) => url === 'http://dashboard.test:9119/api/sessions',
+      ) ?? []
+      expect(new Headers(init?.headers).get('Authorization')).toBe(
+        'Bearer ephemeral-token',
+      )
+    })
+
+    it('does not send dashboard Basic Auth to an arbitrary absolute URL', async () => {
+      process.env.HERMES_DASHBOARD_URL = 'http://dashboard.test:9119'
+      process.env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME = 'workspace-user'
+      process.env.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = 'workspace-password'
+      fetchMock.mockResolvedValue(new Response('{}', { status: 200 }))
+
+      const mod = await loadMod()
+      await mod.dashboardFetch('http://other-host.test/api/sessions')
+
+      const [, init] = fetchMock.mock.calls.at(-1) ?? []
+      expect(new Headers(init?.headers).has('Authorization')).toBe(false)
+    })
+
+    it('preserves unauthenticated root scraping when Basic credentials are absent', async () => {
+      process.env.HERMES_DASHBOARD_URL = 'http://dashboard.test:9119'
+      fetchMock.mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: async () => '<script>window.__HERMES_SESSION_TOKEN__="ephemeral-token"</script>',
+      })
+
+      const mod = await loadMod()
+      await mod.fetchDashboardToken()
+
+      const [, init] = fetchMock.mock.calls.find(
+        ([url]) => url === 'http://dashboard.test:9119/',
+      ) ?? []
+      expect(new Headers(init?.headers).has('Authorization')).toBe(false)
+    })
+
     it('scrapes the inline dashboard session token from root HTML', async () => {
       fetchMock.mockResolvedValue({
         ok: true,
