@@ -371,9 +371,25 @@ export const Route = createFileRoute('/api/send-stream')({
         }
 
         const workspaceScope = await loadWorkspaceCatalog().catch(() => null)
+
+        // Workspace and Hermes Agent can run in different containers and see
+        // different filesystem paths. When configured, use the Agent-visible
+        // path only for the workspace_context sent upstream. Do not validate
+        // this path against the Workspace container filesystem.
+        const agentWorkspacePath = readString(
+          process.env.HERMES_AGENT_WORKSPACE_DIR,
+        )
+        const agentWorkspaceScope = agentWorkspacePath
+          ? {
+              path: agentWorkspacePath,
+              folderName: workspaceScope?.folderName || 'Home',
+              isValid: true,
+            }
+          : workspaceScope
+
         const scopedMessage = buildWorkspaceScopedTextMessage(
           getChatMessage(message, attachments),
-          workspaceScope,
+          agentWorkspaceScope,
         )
 
         // Create streaming response using the SHARED server connection
